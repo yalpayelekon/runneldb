@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
+	"time"
 )
 
 func openTestDB(t *testing.T) *DB {
@@ -462,6 +463,60 @@ func TestCompactEmptyAndDelete(t *testing.T) {
 	}
 	if db.Metrics().Keys != 0 {
 		t.Fatalf("keys=%d", db.Metrics().Keys)
+	}
+}
+
+func TestBackgroundCheckpoint(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "ckpt.wal")
+	db, err := OpenWithOptions(path, Options{
+		AutoCheckpoint:        true,
+		CheckpointEveryCommit: 3,
+		CheckpointMinBytes:    0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	for i := 0; i < 10; i++ {
+		if err := db.Update(func(tx *Tx) error {
+			return tx.Set("k", []byte{byte(i)})
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Give the worker time to fire.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if db.Metrics().Checkpoints > 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if db.Metrics().Checkpoints == 0 {
+		t.Fatal("expected at least one background checkpoint")
+	}
+}
+
+func TestWALBytesMetric(t *testing.T) {
+	db := openTestDB(t)
+	if err := db.Update(func(tx *Tx) error { return tx.Set("k", []byte("v")) }); err != nil {
+		t.Fatal(err)
+	}
+	m := db.Metrics()
+	if m.WALBytes <= 0 {
+		t.Fatalf("WALBytes=%d", m.WALBytes)
+	}
+}
+
+func TestOpenWithDefaultOptions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "opts.wal")
+	db, err := OpenWithOptions(path, DefaultOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.Update(func(tx *Tx) error { return tx.Set("k", []byte("v")) }); err != nil {
+		t.Fatal(err)
 	}
 }
 

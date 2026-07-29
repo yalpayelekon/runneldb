@@ -27,21 +27,33 @@ simple to ship, easy to inspect, and designed for modern concurrent services.
 ```text
 Go API / HTTP / future database/sql driver
                   |
+     SQL Exec/Query (minimal dialect)
+                  |
+  catalog + B+tree PK + secondary indexes
+                  |
+           4KiB slotted pages / rows
+                  |
           transactions + MVCC
                   |
-       indexes / future SQL executor
-                  |
-       append-only WAL + snapshots
+  append-only WAL + background checkpoints
                   |
                one file
 ```
 
-The current implementation deliberately begins at the transaction and WAL
-layers. Every higher-level feature should rest on a small, testable core.
+## Compaction and background checkpoints
 
-## Compaction today vs later
+Stage 1 exposed an explicit `Compact()` API. Stage 3 adds a background
+checkpoint worker that periodically compacts the WAL when commit count or file
+size thresholds are met. The worker runs as a single goroutine per `DB`,
+started on `Open` (configurable via `OpenWithOptions`), and stopped cleanly by
+`Close`. The checkpoint still rewrites the single WAL file—a separate pagefile
+format remains a future stage.
 
-Stage 1 exposes an explicit `Compact()` API so reclaiming history and rewriting
-the WAL is testable and operator-driven. Automatic background checkpoints and
-online maintenance remain a later stage, in line with the principle that
-operations should eventually disappear without callers having to schedule them.
+## Secondary indexes
+
+Stage 3 introduces online secondary indexes (`CREATE INDEX` / `DROP INDEX`) on
+single non-PK INTEGER or TEXT columns. Indexes are built by scanning the table
+under successive read snapshots, then swapped live under the write lock. DML
+maintains all secondary trees automatically. The query planner uses a secondary
+index for single-column equality when no PK equality is present. Multi-column
+and unique secondary indexes are deferred.

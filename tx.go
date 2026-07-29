@@ -40,6 +40,21 @@ func (tx *Tx) Get(key string) ([]byte, bool) {
 
 // Set records a value to be written on commit.
 func (tx *Tx) Set(key string, value []byte) error {
+	if isReservedKey(key) {
+		return ErrReservedKey
+	}
+	return tx.put(key, value)
+}
+
+// Delete records a key deletion to be applied on commit.
+func (tx *Tx) Delete(key string) error {
+	if isReservedKey(key) {
+		return ErrReservedKey
+	}
+	return tx.del(key)
+}
+
+func (tx *Tx) put(key string, value []byte) error {
 	if tx.closed {
 		return ErrTxClosed
 	}
@@ -50,8 +65,7 @@ func (tx *Tx) Set(key string, value []byte) error {
 	return nil
 }
 
-// Delete records a key deletion to be applied on commit.
-func (tx *Tx) Delete(key string) error {
+func (tx *Tx) del(key string) error {
 	if tx.closed {
 		return ErrTxClosed
 	}

@@ -21,6 +21,8 @@ type Metrics struct {
 	Commits     uint64 `json:"commits"`
 	Conflicts   uint64 `json:"conflicts"`
 	Compactions uint64 `json:"compactions"`
+	Checkpoints uint64 `json:"checkpoints"`
+	WALBytes    int64  `json:"wal_bytes"`
 	Keys        int    `json:"keys"`
 }
 
@@ -33,24 +35,35 @@ type DB struct {
 	version     uint64
 	closed      bool
 	active      map[*Tx]uint64
+	tables      map[string]*TableDef
+	indexes     map[string]*btree
+	secIndexes  map[string]*secondaryIdx
+	ckpt        *checkpointWorker
 	reads       atomic.Uint64
 	commits     atomic.Uint64
 	conflicts   atomic.Uint64
 	compactions atomic.Uint64
 }
 
-// Open opens or creates a database at path and replays its WAL.
-// A torn or corrupt final record is truncated; mid-file corruption fails.
+// Open opens or creates a database at path with default options.
 func Open(path string) (*DB, error) {
+	return OpenWithOptions(path, DefaultOptions())
+}
+
+// OpenWithOptions opens or creates a database at path with explicit options.
+func OpenWithOptions(path string, opts Options) (*DB, error) {
 	file, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
 	db := &DB{
-		path:    path,
-		file:    file,
-		history: make(map[string][]valueVersion),
-		active:  make(map[*Tx]uint64),
+		path:       path,
+		file:       file,
+		history:    make(map[string][]valueVersion),
+		active:     make(map[*Tx]uint64),
+		tables:     make(map[string]*TableDef),
+		indexes:    make(map[string]*btree),
+		secIndexes: make(map[string]*secondaryIdx),
 	}
 	lastGood, err := initWAL(file, db.apply)
 	if err != nil {
@@ -71,6 +84,15 @@ func Open(path string) (*DB, error) {
 	if _, err := file.Seek(0, io.SeekEnd); err != nil {
 		_ = file.Close()
 		return nil, err
+	}
+	if err := db.rebuildSQLState(); err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	if opts.AutoCheckpoint {
+		w := newCheckpointWorker(db, opts)
+		db.ckpt = w
+		w.start()
 	}
 	return db, nil
 }
@@ -155,20 +177,39 @@ func (db *DB) Metrics() Metrics {
 			keys++
 		}
 	}
+	var walBytes int64
+	if db.file != nil {
+		if info, err := db.file.Stat(); err == nil {
+			walBytes = info.Size()
+		}
+	}
+	var ckpts uint64
+	if db.ckpt != nil {
+		ckpts = db.ckpt.checkpoints.Load()
+	}
 	return Metrics{
 		Version: db.version, Reads: db.reads.Load(), Commits: db.commits.Load(),
-		Conflicts: db.conflicts.Load(), Compactions: db.compactions.Load(), Keys: keys,
+		Conflicts: db.conflicts.Load(), Compactions: db.compactions.Load(),
+		Checkpoints: ckpts, WALBytes: walBytes, Keys: keys,
 	}
 }
 
 // Close flushes and closes the database.
 func (db *DB) Close() error {
 	db.mu.Lock()
-	defer db.mu.Unlock()
 	if db.closed {
+		db.mu.Unlock()
 		return nil
 	}
 	db.closed = true
+	ckpt := db.ckpt
+	db.ckpt = nil
+	db.mu.Unlock()
+	if ckpt != nil {
+		ckpt.close()
+	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
 	return db.file.Close()
 }
 

@@ -18,6 +18,18 @@ func Handler(db *DB) http.Handler {
 	mux.HandleFunc("/v1/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, db.Metrics())
 	})
+	mux.HandleFunc("/v1/checkpoint", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := db.Compact(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("/v1/compact", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Allow", "POST")
@@ -29,6 +41,52 @@ func Handler(db *DB) http.Handler {
 			return
 		}
 		w.WriteHeader(http.StatusNoContent)
+	})
+	mux.HandleFunc("/v1/sql", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			SQL  string `json:"sql"`
+			Args []any  `json:"args"`
+		}
+		if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		upper := strings.ToUpper(strings.TrimSpace(req.SQL))
+		if strings.HasPrefix(upper, "SELECT") {
+			rows, err := db.Query(req.SQL, req.Args...)
+			if err != nil {
+				writeSQLErr(w, err)
+				return
+			}
+			defer rows.Close()
+			cols := rows.Columns()
+			var outRows [][]any
+			for rows.Next() {
+				dest := make([]any, len(cols))
+				ptrs := make([]any, len(cols))
+				for i := range dest {
+					ptrs[i] = &dest[i]
+				}
+				if err := rows.Scan(ptrs...); err != nil {
+					writeSQLErr(w, err)
+					return
+				}
+				outRows = append(outRows, dest)
+			}
+			writeJSON(w, http.StatusOK, map[string]any{"columns": cols, "rows": outRows})
+			return
+		}
+		res, err := db.Exec(req.SQL, req.Args...)
+		if err != nil {
+			writeSQLErr(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"rows_affected": res.RowsAffected})
 	})
 	mux.HandleFunc("/v1/kv/", func(w http.ResponseWriter, r *http.Request) {
 		key := strings.TrimPrefix(r.URL.Path, "/v1/kv/")
@@ -87,4 +145,12 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeSQLErr(w http.ResponseWriter, err error) {
+	if errors.Is(err, ErrConflict) {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	http.Error(w, err.Error(), http.StatusBadRequest)
 }

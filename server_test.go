@@ -89,3 +89,48 @@ func TestCompactHTTP(t *testing.T) {
 		t.Fatalf("compactions=%d", db.Metrics().Compactions)
 	}
 }
+
+func TestCheckpointHTTP(t *testing.T) {
+	db := openTestDB(t)
+	server := httptest.NewServer(Handler(db))
+	defer server.Close()
+
+	req, _ := http.NewRequest(http.MethodPost, server.URL+"/v1/checkpoint", nil)
+	res, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = res.Body.Close()
+	if res.StatusCode != http.StatusNoContent {
+		t.Fatalf("checkpoint status: %d", res.StatusCode)
+	}
+}
+
+func TestSQLHTTP(t *testing.T) {
+	db := openTestDB(t)
+	server := httptest.NewServer(Handler(db))
+	defer server.Close()
+
+	post := func(body string) (int, string) {
+		t.Helper()
+		res, err := http.Post(server.URL+"/v1/sql", "application/json", strings.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(res.Body)
+		_ = res.Body.Close()
+		return res.StatusCode, string(b)
+	}
+	code, _ := post(`{"sql":"CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)"}`)
+	if code != http.StatusOK {
+		t.Fatalf("create %d", code)
+	}
+	code, _ = post(`{"sql":"INSERT INTO users VALUES (?, ?)","args":[1,"ada"]}`)
+	if code != http.StatusOK {
+		t.Fatalf("insert %d", code)
+	}
+	code, body := post(`{"sql":"SELECT name FROM users WHERE id = 1"}`)
+	if code != http.StatusOK || !strings.Contains(body, "ada") {
+		t.Fatalf("select %d %s", code, body)
+	}
+}
