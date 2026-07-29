@@ -18,6 +18,18 @@ func Handler(db *DB) http.Handler {
 	mux.HandleFunc("/v1/metrics", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, db.Metrics())
 	})
+	mux.HandleFunc("/v1/compact", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if err := db.Compact(); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+	})
 	mux.HandleFunc("/v1/kv/", func(w http.ResponseWriter, r *http.Request) {
 		key := strings.TrimPrefix(r.URL.Path, "/v1/kv/")
 		if key == "" {
@@ -56,7 +68,9 @@ func Handler(db *DB) http.Handler {
 			}
 		case http.MethodDelete:
 			err := db.Update(func(tx *Tx) error { return tx.Delete(key) })
-			if err != nil {
+			if errors.Is(err, ErrConflict) {
+				http.Error(w, err.Error(), http.StatusConflict)
+			} else if err != nil {
 				http.Error(w, err.Error(), http.StatusInternalServerError)
 			} else {
 				w.WriteHeader(http.StatusNoContent)

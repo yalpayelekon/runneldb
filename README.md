@@ -9,18 +9,20 @@ operations.
 
 > [!WARNING]
 > RunnelDB is pre-alpha. The file format and API will change. Do not use it for
-> important data yet.
+> important data yet. On-disk WALs use format version 1 (`RNDB` magic); older
+> unheadered files are not readable.
 
 ## What works today
 
 - snapshot-isolated reads
 - optimistic concurrent transactions
-- atomic, checksummed, append-only write-ahead log
-- recovery after reopen
+- atomic, checksummed, append-only write-ahead log (format v1)
+- recovery after reopen, including truncate of a torn or corrupt tail
 - point-in-time read snapshots
+- explicit `Compact()` to prune unreachable versions and rewrite the WAL
 - lock-free reads after transaction start
-- built-in operation and conflict counters
-- a small JSON-over-HTTP server
+- built-in operation, conflict, and compaction counters
+- a small JSON-over-HTTP server (`/v1/kv`, `/v1/metrics`, `/v1/compact`)
 - zero third-party runtime dependencies
 
 SQL is not implemented yet. The current key/value API is the storage kernel on
@@ -58,6 +60,10 @@ func main() {
 		fmt.Println(string(value))
 		return nil
 	})
+
+	if err := db.Compact(); err != nil {
+		log.Fatal(err)
+	}
 }
 ```
 
@@ -67,8 +73,23 @@ Or run the server:
 go run ./cmd/runneldb serve --path data.wal --addr :7070
 curl -X PUT localhost:7070/v1/kv/hello -d world
 curl localhost:7070/v1/kv/hello
+curl -X POST localhost:7070/v1/compact
 curl localhost:7070/v1/metrics
 ```
+
+## Durability and recovery
+
+Each commit appends a length-prefixed, CRC32-protected JSON record and syncs
+the file. On `Open`, RunnelDB validates the 16-byte file header, replays
+records, and **truncates a torn or corrupt final record**. Corruption that is
+followed by another valid record fails open (`ErrWALCorrupt`).
+
+## Compaction
+
+`DB.Compact()` (or `POST /v1/compact`) drops MVCC versions older than the
+oldest open transaction snapshot and atomically rewrites the WAL. With no open
+readers it writes a single snapshot of live keys. Background auto-compaction
+is intentionally deferred to a later roadmap stage.
 
 ## Concurrency model
 

@@ -68,12 +68,17 @@ func (tx *Tx) Commit() error {
 		return ErrTxClosed
 	}
 	if !tx.writable {
+		tx.db.mu.Lock()
+		tx.db.unregister(tx)
+		tx.db.mu.Unlock()
 		tx.closed = true
 		return nil
 	}
 	tx.db.mu.Lock()
 	defer tx.db.mu.Unlock()
+	defer tx.db.unregister(tx)
 	if tx.db.closed {
+		tx.closed = true
 		return ErrClosed
 	}
 	keys := make([]string, 0, len(tx.writes))
@@ -99,6 +104,7 @@ func (tx *Tx) Commit() error {
 	}
 	rec := record{Version: tx.db.version + 1, Ops: ops}
 	if err := appendRecord(tx.db.file, rec); err != nil {
+		tx.closed = true
 		return err
 	}
 	tx.db.apply(rec)
@@ -109,6 +115,12 @@ func (tx *Tx) Commit() error {
 
 // Rollback discards pending writes. It is safe to call more than once.
 func (tx *Tx) Rollback() {
+	if tx.closed {
+		return
+	}
+	tx.db.mu.Lock()
+	tx.db.unregister(tx)
+	tx.db.mu.Unlock()
 	tx.closed = true
 	tx.writes = nil
 }
