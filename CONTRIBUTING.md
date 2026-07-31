@@ -10,9 +10,11 @@ tests, documentation, and focused pull requests are welcome.
    `go test -fuzz=FuzzWALReplay -fuzztime=20s`.
 5. For SQL parser changes, run:
    `go test -fuzz=FuzzSQLParse -fuzztime=10s`.
-6. The background checkpoint worker uses a 1 s ticker; tests that exercise it
+6. For binary JSON codec changes, run:
+   `go test -fuzz=FuzzJSONBin -fuzztime=10s`.
+7. The background checkpoint worker uses a 1 s ticker; tests that exercise it
    lower the thresholds and poll with a deadline—always use `-race` when
    touching checkpoint or compaction code.
-7. Avoid dependencies unless they clearly earn their place.
+8. Avoid dependencies unless they clearly earn their place.
 
 By participating, you agree to follow the [Code of Conduct](CODE_OF_CONDUCT.md).

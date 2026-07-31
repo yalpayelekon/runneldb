@@ -146,6 +146,8 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 		typ = TypeText
 	case "BLOB":
 		typ = TypeBlob
+	case "JSON":
+		typ = TypeJSON
 	default:
 		return ColumnDef{}, fmt.Errorf("%w: unknown type %s", ErrSQL, p.tok.kw)
 	}
@@ -161,6 +163,9 @@ func (p *parser) parseColumnDef() (ColumnDef, error) {
 			return ColumnDef{}, err
 		}
 		pk = true
+	}
+	if pk && typ != TypeInteger && typ != TypeText {
+		return ColumnDef{}, fmt.Errorf("%w: PRIMARY KEY must be INTEGER or TEXT", ErrSQL)
 	}
 	return ColumnDef{Name: name, Type: typ, PK: pk}, nil
 }
@@ -193,7 +198,23 @@ func (p *parser) parseCreateIndex() (stmt, error) {
 	if err := p.expect(tokRParen, ")"); err != nil {
 		return nil, err
 	}
-	return createIndexStmt{index: name, table: table, column: col}, nil
+	path := ""
+	if p.tok.kind == tokKeyword && p.tok.kw == "PATH" {
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+		if p.tok.kind != tokString {
+			return nil, fmt.Errorf("%w: expected path string at %d", ErrSQL, p.tok.pos)
+		}
+		path = p.tok.lit
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+		if _, err := parseJSONPath(path); err != nil {
+			return nil, err
+		}
+	}
+	return createIndexStmt{index: name, table: table, column: col, path: path}, nil
 }
 
 func (p *parser) parseDrop() (stmt, error) {
@@ -289,19 +310,19 @@ func (p *parser) parseSelect() (stmt, error) {
 	if err := p.expectKeyword("SELECT"); err != nil {
 		return nil, err
 	}
-	var cols []string
+	var cols []selectItem
 	if p.tok.kind == tokStar {
-		cols = []string{"*"}
+		cols = []selectItem{{kind: selectStar}}
 		if err := p.advance(); err != nil {
 			return nil, err
 		}
 	} else {
 		for {
-			c, err := p.parseIdent()
+			item, err := p.parseSelectItem()
 			if err != nil {
 				return nil, err
 			}
-			cols = append(cols, c)
+			cols = append(cols, item)
 			if p.tok.kind == tokComma {
 				if err := p.advance(); err != nil {
 					return nil, err
@@ -323,6 +344,51 @@ func (p *parser) parseSelect() (stmt, error) {
 		return nil, err
 	}
 	return selectStmt{table: table, columns: cols, where: where}, nil
+}
+
+func (p *parser) parseSelectItem() (selectItem, error) {
+	if p.tok.kind == tokKeyword && p.tok.kw == "JSON_EXTRACT" {
+		col, path, err := p.parseJSONExtractCall()
+		if err != nil {
+			return selectItem{}, err
+		}
+		return selectItem{kind: selectExtract, column: col, path: path}, nil
+	}
+	c, err := p.parseIdent()
+	if err != nil {
+		return selectItem{}, err
+	}
+	return selectItem{kind: selectColumn, column: c}, nil
+}
+
+func (p *parser) parseJSONExtractCall() (col, path string, err error) {
+	if err := p.expectKeyword("JSON_EXTRACT"); err != nil {
+		return "", "", err
+	}
+	if err := p.expect(tokLParen, "("); err != nil {
+		return "", "", err
+	}
+	col, err = p.parseIdent()
+	if err != nil {
+		return "", "", err
+	}
+	if err := p.expect(tokComma, ","); err != nil {
+		return "", "", err
+	}
+	if p.tok.kind != tokString {
+		return "", "", fmt.Errorf("%w: expected path string at %d", ErrSQL, p.tok.pos)
+	}
+	path = p.tok.lit
+	if err := p.advance(); err != nil {
+		return "", "", err
+	}
+	if _, err := parseJSONPath(path); err != nil {
+		return "", "", err
+	}
+	if err := p.expect(tokRParen, ")"); err != nil {
+		return "", "", err
+	}
+	return col, path, nil
 }
 
 func (p *parser) parseUpdate() (stmt, error) {
@@ -392,18 +458,11 @@ func (p *parser) parseWhereOptional() ([]pred, error) {
 	}
 	var preds []pred
 	for {
-		col, err := p.parseIdent()
+		pr, err := p.parsePred()
 		if err != nil {
 			return nil, err
 		}
-		if err := p.expect(tokEq, "="); err != nil {
-			return nil, err
-		}
-		e, err := p.parseExpr()
-		if err != nil {
-			return nil, err
-		}
-		preds = append(preds, pred{column: col, value: e})
+		preds = append(preds, pr)
 		if p.tok.kind == tokKeyword && p.tok.kw == "AND" {
 			if err := p.advance(); err != nil {
 				return nil, err
@@ -413,6 +472,35 @@ func (p *parser) parseWhereOptional() ([]pred, error) {
 		break
 	}
 	return preds, nil
+}
+
+func (p *parser) parsePred() (pred, error) {
+	if p.tok.kind == tokKeyword && p.tok.kw == "JSON_EXTRACT" {
+		col, path, err := p.parseJSONExtractCall()
+		if err != nil {
+			return pred{}, err
+		}
+		if err := p.expect(tokEq, "="); err != nil {
+			return pred{}, err
+		}
+		e, err := p.parseExpr()
+		if err != nil {
+			return pred{}, err
+		}
+		return pred{kind: predExtract, column: col, path: path, value: e}, nil
+	}
+	col, err := p.parseIdent()
+	if err != nil {
+		return pred{}, err
+	}
+	if err := p.expect(tokEq, "="); err != nil {
+		return pred{}, err
+	}
+	e, err := p.parseExpr()
+	if err != nil {
+		return pred{}, err
+	}
+	return pred{kind: predColumn, column: col, value: e}, nil
 }
 
 func (p *parser) parseExpr() (expr, error) {

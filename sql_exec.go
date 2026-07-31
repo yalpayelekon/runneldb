@@ -74,6 +74,12 @@ func assignScan(dest any, v Value) error {
 				*d = v.Text
 			case TypeBlob:
 				*d = v.Blob
+			case TypeJSON:
+				text, err := jsonToText(v.Blob)
+				if err != nil {
+					return err
+				}
+				*d = text
 			default:
 				*d = nil
 			}
@@ -93,6 +99,12 @@ func assignScan(dest any, v Value) error {
 			*d = v.Text
 		} else if v.Typ == TypeInteger {
 			*d = fmt.Sprintf("%d", v.Int)
+		} else if v.Typ == TypeJSON {
+			text, err := jsonToText(v.Blob)
+			if err != nil {
+				return err
+			}
+			*d = text
 		} else {
 			return fmt.Errorf("%w: cannot scan into *string", ErrSQL)
 		}
@@ -103,6 +115,12 @@ func assignScan(dest any, v Value) error {
 			*d = append([]byte(nil), v.Blob...)
 		} else if v.Typ == TypeText {
 			*d = []byte(v.Text)
+		} else if v.Typ == TypeJSON {
+			text, err := jsonToText(v.Blob)
+			if err != nil {
+				return err
+			}
+			*d = []byte(text)
 		} else {
 			return fmt.Errorf("%w: cannot scan into *[]byte", ErrSQL)
 		}
@@ -297,6 +315,21 @@ func exprToValue(e expr, typ ColType) (Value, error) {
 			return Value{}, fmt.Errorf("%w: expected BLOB", ErrSQL)
 		}
 		return Value{Typ: TypeBlob, Blob: e.blob}, nil
+	case TypeJSON:
+		var raw []byte
+		switch e.kind {
+		case exprText:
+			raw = []byte(e.s)
+		case exprBlob:
+			raw = e.blob
+		default:
+			return Value{}, fmt.Errorf("%w: expected JSON text", ErrSQL)
+		}
+		bin, err := encodeJSON(raw)
+		if err != nil {
+			return Value{}, err
+		}
+		return Value{Typ: TypeJSON, Blob: bin}, nil
 	default:
 		return Value{}, fmt.Errorf("%w: unknown column type", ErrSQL)
 	}
@@ -451,11 +484,16 @@ func (db *DB) execInsert(s insertStmt) (Result, error) {
 	}
 	db.indexes[name].Put(pk, rk)
 	for _, si := range db.secIndexes {
-		if si.def.Table == name {
-			ci, err := def.columnIndex(si.def.Column)
-			if err == nil {
-				si.insert(values[ci], pk, rk)
-			}
+		if si.def.Table != name {
+			continue
+		}
+		iv, ok, err := si.valueFromRow(def, values)
+		if err != nil {
+			db.mu.Unlock()
+			return Result{}, err
+		}
+		if ok {
+			si.insert(iv, pk, rk)
 		}
 	}
 	db.mu.Unlock()
@@ -530,14 +568,25 @@ func (db *DB) execUpdate(s updateStmt) (Result, error) {
 	if err == nil {
 		db.mu.Lock()
 		for _, si := range db.secIndexes {
-			if si.def.Table == name {
-				ci, cerr := def.columnIndex(si.def.Column)
-				if cerr != nil {
-					continue
+			if si.def.Table != name {
+				continue
+			}
+			for _, u := range updated {
+				oldV, oldOK, oerr := si.valueFromRow(def, u.oldRow)
+				if oerr != nil {
+					db.mu.Unlock()
+					return Result{}, oerr
 				}
-				for _, u := range updated {
-					si.remove(u.oldRow[ci], u.pk)
-					si.insert(u.newRow[ci], u.pk, rowKey(name, u.pk.encode()))
+				newV, newOK, nerr := si.valueFromRow(def, u.newRow)
+				if nerr != nil {
+					db.mu.Unlock()
+					return Result{}, nerr
+				}
+				if oldOK {
+					si.remove(oldV, u.pk)
+				}
+				if newOK {
+					si.insert(newV, u.pk, rowKey(name, u.pk.encode()))
 				}
 			}
 		}
@@ -584,13 +633,17 @@ func (db *DB) execDelete(s deleteStmt) (Result, error) {
 		}
 	}
 	for _, si := range db.secIndexes {
-		if si.def.Table == name {
-			ci, cerr := def.columnIndex(si.def.Column)
-			if cerr != nil {
-				continue
+		if si.def.Table != name {
+			continue
+		}
+		for i, k := range removed {
+			iv, ok, ierr := si.valueFromRow(def, removedVals[i])
+			if ierr != nil {
+				db.mu.Unlock()
+				return Result{}, ierr
 			}
-			for i, k := range removed {
-				si.remove(removedVals[i][ci], k)
+			if ok {
+				si.remove(iv, k)
 			}
 		}
 	}
@@ -611,7 +664,7 @@ func (db *DB) collectRows(tx *Tx, def *TableDef, where []pred) ([]rowItem, error
 		return nil, err
 	}
 	// PK equality fast path via index.
-	if len(where) == 1 && normalizeName(where[0].column) == pkCol.Name {
+	if len(where) == 1 && where[0].kind == predColumn && normalizeName(where[0].column) == pkCol.Name {
 		v, err := exprToValue(where[0].value, pkCol.Type)
 		if err != nil {
 			return nil, err
@@ -645,26 +698,42 @@ func (db *DB) collectRows(tx *Tx, def *TableDef, where []pred) ([]rowItem, error
 		return []rowItem{{pk: k, rowKey: rk, values: vals}}, nil
 	}
 
-	// Secondary index equality fast path.
+	// Secondary / path index equality fast path.
 	if len(where) == 1 {
-		col := normalizeName(where[0].column)
+		w := where[0]
 		db.mu.RLock()
 		var si *secondaryIdx
 		for _, s := range db.secIndexes {
-			if s.def.Table == def.Name && s.def.Column == col {
+			if s.def.Table != def.Name {
+				continue
+			}
+			if w.kind == predColumn && s.def.Path == "" && s.def.Column == normalizeName(w.column) {
+				si = s
+				break
+			}
+			if w.kind == predExtract && s.def.Path == w.path && s.def.Column == normalizeName(w.column) {
 				si = s
 				break
 			}
 		}
 		db.mu.RUnlock()
 		if si != nil {
-			ci, err := def.columnIndex(col)
-			if err != nil {
-				return nil, err
-			}
-			val, err := exprToValue(where[0].value, def.Columns[ci].Type)
-			if err != nil {
-				return nil, err
+			var val Value
+			if w.kind == predExtract {
+				// Compare against extracted leaf type (INTEGER or TEXT).
+				val, err = predValueForExtract(w.value)
+				if err != nil {
+					return nil, err
+				}
+			} else {
+				ci, err := def.columnIndex(normalizeName(w.column))
+				if err != nil {
+					return nil, err
+				}
+				val, err = exprToValue(w.value, def.Columns[ci].Type)
+				if err != nil {
+					return nil, err
+				}
 			}
 			db.mu.RLock()
 			rks := si.lookup(val)
@@ -701,11 +770,15 @@ func (db *DB) collectRows(tx *Tx, def *TableDef, where []pred) ([]rowItem, error
 		if err != nil {
 			return nil, err
 		}
-		if !matchWhere(def, vals, where) {
+		ok, err := matchWhere(def, vals, where)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
 			continue
 		}
-		enc, ok := parseRowKey(def.Name, p.Key)
-		if !ok {
+		enc, okp := parseRowKey(def.Name, p.Key)
+		if !okp {
 			continue
 		}
 		k, err := pkKeyFromEncoded(enc)
@@ -718,21 +791,58 @@ func (db *DB) collectRows(tx *Tx, def *TableDef, where []pred) ([]rowItem, error
 	return out, nil
 }
 
-func matchWhere(def *TableDef, vals []Value, where []pred) bool {
+func predValueForExtract(e expr) (Value, error) {
+	switch e.kind {
+	case exprInt:
+		return Value{Typ: TypeInteger, Int: e.i}, nil
+	case exprText:
+		return Value{Typ: TypeText, Text: e.s}, nil
+	case exprNull:
+		return Value{Null: true}, nil
+	default:
+		return Value{}, fmt.Errorf("%w: json_extract comparison expects INTEGER or TEXT", ErrSQL)
+	}
+}
+
+func matchWhere(def *TableDef, vals []Value, where []pred) (bool, error) {
 	for _, w := range where {
+		if w.kind == predExtract {
+			ci, err := def.columnIndex(normalizeName(w.column))
+			if err != nil {
+				return false, nil
+			}
+			if vals[ci].Null || vals[ci].Typ != TypeJSON {
+				return false, nil
+			}
+			got, ok, err := jsonExtract(vals[ci].Blob, w.path)
+			if err != nil {
+				return false, err
+			}
+			if !ok {
+				return false, nil
+			}
+			want, err := predValueForExtract(w.value)
+			if err != nil {
+				return false, err
+			}
+			if !valuesEqual(got, want) {
+				return false, nil
+			}
+			continue
+		}
 		ci, err := def.columnIndex(normalizeName(w.column))
 		if err != nil {
-			return false
+			return false, nil
 		}
 		want, err := exprToValue(w.value, def.Columns[ci].Type)
 		if err != nil {
-			return false
+			return false, nil
 		}
 		if !valuesEqual(vals[ci], want) {
-			return false
+			return false, nil
 		}
 	}
-	return true
+	return true, nil
 }
 
 func valuesEqual(a, b Value) bool {
@@ -747,7 +857,7 @@ func valuesEqual(a, b Value) bool {
 		return a.Int == b.Int
 	case TypeText:
 		return a.Text == b.Text
-	case TypeBlob:
+	case TypeBlob, TypeJSON:
 		return string(a.Blob) == string(b.Blob)
 	default:
 		return false
@@ -760,22 +870,49 @@ func (db *DB) execSelect(s selectStmt) (*Rows, error) {
 	if err != nil {
 		return nil, err
 	}
-	var colIdxs []int
-	var colNames []string
-	if len(s.columns) == 0 || (len(s.columns) == 1 && s.columns[0] == "*") {
+
+	type proj struct {
+		kind   selectItemKind
+		colIdx int
+		path   string
+		name   string
+	}
+	var projs []proj
+	if len(s.columns) == 0 || (len(s.columns) == 1 && s.columns[0].kind == selectStar) {
 		for i, c := range def.Columns {
-			colIdxs = append(colIdxs, i)
-			colNames = append(colNames, c.Name)
+			projs = append(projs, proj{kind: selectColumn, colIdx: i, name: c.Name})
 		}
 	} else {
 		for _, c := range s.columns {
-			i, err := def.columnIndex(normalizeName(c))
-			if err != nil {
-				return nil, err
+			switch c.kind {
+			case selectStar:
+				for i, col := range def.Columns {
+					projs = append(projs, proj{kind: selectColumn, colIdx: i, name: col.Name})
+				}
+			case selectColumn:
+				i, err := def.columnIndex(normalizeName(c.column))
+				if err != nil {
+					return nil, err
+				}
+				projs = append(projs, proj{kind: selectColumn, colIdx: i, name: def.Columns[i].Name})
+			case selectExtract:
+				i, err := def.columnIndex(normalizeName(c.column))
+				if err != nil {
+					return nil, err
+				}
+				if def.Columns[i].Type != TypeJSON {
+					return nil, fmt.Errorf("%w: json_extract requires JSON column", ErrSQL)
+				}
+				projs = append(projs, proj{
+					kind: selectExtract, colIdx: i, path: c.path,
+					name: "json_extract(" + def.Columns[i].Name + ", '" + c.path + "')",
+				})
 			}
-			colIdxs = append(colIdxs, i)
-			colNames = append(colNames, def.Columns[i].Name)
 		}
+	}
+	colNames := make([]string, len(projs))
+	for i, p := range projs {
+		colNames[i] = p.name
 	}
 
 	var data [][]Value
@@ -785,9 +922,26 @@ func (db *DB) execSelect(s selectStmt) (*Rows, error) {
 			return err
 		}
 		for _, item := range rows {
-			out := make([]Value, len(colIdxs))
-			for j, ci := range colIdxs {
-				out[j] = item.values[ci]
+			out := make([]Value, len(projs))
+			for j, p := range projs {
+				if p.kind == selectExtract {
+					col := item.values[p.colIdx]
+					if col.Null || col.Typ != TypeJSON {
+						out[j] = Value{Null: true}
+						continue
+					}
+					v, ok, err := jsonExtract(col.Blob, p.path)
+					if err != nil {
+						return err
+					}
+					if !ok {
+						out[j] = Value{Null: true}
+					} else {
+						out[j] = v
+					}
+				} else {
+					out[j] = item.values[p.colIdx]
+				}
 			}
 			data = append(data, out)
 		}
@@ -803,6 +957,7 @@ func (db *DB) execCreateIndex(s createIndexStmt) (Result, error) {
 	idxName := normalizeName(s.index)
 	tableName := normalizeName(s.table)
 	colName := normalizeName(s.column)
+	path := s.path
 
 	db.mu.RLock()
 	def := db.tables[tableName]
@@ -826,11 +981,18 @@ func (db *DB) execCreateIndex(s createIndexStmt) (Result, error) {
 		return Result{}, err
 	}
 	ct := def.Columns[ci].Type
-	if ct != TypeInteger && ct != TypeText {
+	if path != "" {
+		if ct != TypeJSON {
+			return Result{}, fmt.Errorf("%w: PATH indexes require a JSON column", ErrSQL)
+		}
+		if _, err := parseJSONPath(path); err != nil {
+			return Result{}, err
+		}
+	} else if ct != TypeInteger && ct != TypeText {
 		return Result{}, fmt.Errorf("%w: secondary indexes only support INTEGER or TEXT columns", ErrSQL)
 	}
 
-	idef := IndexDef{Name: idxName, Table: tableName, Column: colName}
+	idef := IndexDef{Name: idxName, Table: tableName, Column: colName, Path: path}
 
 	// Build the shadow index by scanning the table.
 	si := newSecondaryIdx(idef)
@@ -849,7 +1011,13 @@ func (db *DB) execCreateIndex(s createIndexStmt) (Result, error) {
 			if err != nil {
 				return err
 			}
-			si.insert(vals[ci], pk, p.Key)
+			iv, ok, err := si.valueFromRow(def, vals)
+			if err != nil {
+				return err
+			}
+			if ok {
+				si.insert(iv, pk, p.Key)
+			}
 		}
 		return nil
 	}); err != nil {
@@ -945,8 +1113,7 @@ func (db *DB) rebuildSQLState() error {
 		if tdef == nil {
 			continue
 		}
-		ci, err := tdef.columnIndex(idef.Column)
-		if err != nil {
+		if _, err := tdef.columnIndex(idef.Column); err != nil {
 			continue
 		}
 		si := newSecondaryIdx(idef)
@@ -965,7 +1132,13 @@ func (db *DB) rebuildSQLState() error {
 				if err != nil {
 					return err
 				}
-				si.insert(vals[ci], pk, p.Key)
+				iv, ok, err := si.valueFromRow(tdef, vals)
+				if err != nil {
+					return err
+				}
+				if ok {
+					si.insert(iv, pk, p.Key)
+				}
 			}
 		}
 		db.secIndexes[idef.Name] = si

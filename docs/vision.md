@@ -29,7 +29,7 @@ Go API / HTTP / future database/sql driver
                   |
      SQL Exec/Query (minimal dialect)
                   |
-  catalog + B+tree PK + secondary indexes
+  catalog + B+tree PK + secondary + JSON path indexes
                   |
            4KiB slotted pages / rows
                   |
@@ -57,3 +57,12 @@ under successive read snapshots, then swapped live under the write lock. DML
 maintains all secondary trees automatically. The query planner uses a secondary
 index for single-column equality when no PK equality is present. Multi-column
 and unique secondary indexes are deferred.
+
+## Binary JSON and path indexes
+
+Stage 4 adds a first-class `JSON` column type stored as a compact binary
+document inside the existing row codec. SQLite-flavored `json_extract(col, '$.a.b')`
+supports SELECT projection and WHERE equality. Path indexes
+(`CREATE INDEX name ON t(col) PATH '$.a.b'`) reuse the Stage 3 secondary-index
+machinery with an `IndexDef.Path` field. Full JSONPath, array indexing,
+`json_set` / `json_patch` mutators, and Postgres `->` operators remain deferred.

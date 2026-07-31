@@ -171,7 +171,7 @@ func isKeyword(s string) bool {
 	switch s {
 	case "CREATE", "TABLE", "DROP", "INSERT", "INTO", "VALUES", "SELECT", "FROM",
 		"UPDATE", "SET", "DELETE", "WHERE", "AND", "PRIMARY", "KEY",
-		"INTEGER", "TEXT", "BLOB", "NULL", "INDEX", "ON":
+		"INTEGER", "TEXT", "BLOB", "JSON", "NULL", "INDEX", "ON", "PATH", "JSON_EXTRACT":
 		return true
 	default:
 		return false

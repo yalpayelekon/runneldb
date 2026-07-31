@@ -11,6 +11,7 @@ type IndexDef struct {
 	Name   string `json:"name"`
 	Table  string `json:"table"`
 	Column string `json:"column"`
+	Path   string `json:"path,omitempty"` // JSON path for path indexes
 }
 
 func catalogIndexKey(name string) string {
@@ -120,4 +121,32 @@ func (si *secondaryIdx) lookup(val Value) []string {
 		out = append(out, v)
 	}
 	return out
+}
+
+// valueFromRow extracts the indexable value for this secondary index from a row.
+// ok=false means the row should not appear in the index (NULL / missing path / wrong type).
+func (si *secondaryIdx) valueFromRow(def *TableDef, vals []Value) (Value, bool, error) {
+	ci, err := def.columnIndex(si.def.Column)
+	if err != nil {
+		return Value{}, false, err
+	}
+	if ci >= len(vals) {
+		return Value{}, false, nil
+	}
+	col := vals[ci]
+	if col.Null {
+		return Value{}, false, nil
+	}
+	if si.def.Path != "" {
+		if col.Typ != TypeJSON {
+			return Value{}, false, nil
+		}
+		return indexableExtract(col.Blob, si.def.Path)
+	}
+	switch col.Typ {
+	case TypeInteger, TypeText:
+		return col, true, nil
+	default:
+		return Value{}, false, nil
+	}
 }

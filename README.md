@@ -24,6 +24,7 @@ operations.
 - 4 KiB slotted pages and typed row codec for SQL storage
 - per-table in-memory B+tree primary-key indexes (rebuilt on open)
 - online secondary indexes (`CREATE INDEX` / `DROP INDEX`) on INTEGER or TEXT columns
+- binary `JSON` columns with `json_extract` and path indexes (`CREATE INDEX ... PATH`)
 - minimal SQLite-flavored SQL: `CREATE`/`DROP TABLE`, `CREATE`/`DROP INDEX`,
   `INSERT`, `SELECT`, `UPDATE`, `DELETE` with `?` placeholders
 - lock-free reads after transaction start
@@ -125,6 +126,24 @@ Indexes are built online (concurrent reads continue), persisted in the catalog,
 and rebuilt on reopen. DML statements automatically maintain all secondary
 indexes on the affected table.
 
+## Binary JSON
+
+`JSON` columns store a compact binary encoding. INSERT/UPDATE accept JSON text;
+SELECT returns JSON as text. Use SQLite-flavored `json_extract` and optional
+path indexes:
+
+```sql
+CREATE TABLE docs (id INTEGER PRIMARY KEY, doc JSON);
+INSERT INTO docs VALUES (1, '{"name":"ada","age":36}');
+CREATE INDEX idx_name ON docs(doc) PATH '$.name';
+SELECT json_extract(doc, '$.name') FROM docs
+  WHERE json_extract(doc, '$.name') = 'ada';
+```
+
+Paths are `$` + `.ident` segments only (no array indexes or wildcards). Path
+indexes cover string and integral leaves; missing or non-indexable paths omit
+the row from the index.
+
 ## Concurrency model
 
 Each transaction reads from a stable version. Commits are serialized briefly
@@ -139,7 +158,7 @@ The roadmap is intentionally staged:
 1. ~~harden the MVCC/WAL kernel, fuzz recovery, add compaction~~
 2. ~~pages, indexes, and a minimal SQLite-flavored SQL parser~~
 3. ~~background checkpoints and online index construction~~
-4. binary JSON with indexed paths
+4. ~~binary JSON with indexed paths~~
 5. vector indexes and streaming WAL replication
 
 See [docs/vision.md](docs/vision.md) for principles and non-goals.

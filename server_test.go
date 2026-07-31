@@ -133,4 +133,17 @@ func TestSQLHTTP(t *testing.T) {
 	if code != http.StatusOK || !strings.Contains(body, "ada") {
 		t.Fatalf("select %d %s", code, body)
 	}
+
+	code, _ = post(`{"sql":"CREATE TABLE docs (id INTEGER PRIMARY KEY, doc JSON)"}`)
+	if code != http.StatusOK {
+		t.Fatalf("create json %d", code)
+	}
+	code, _ = post(`{"sql":"INSERT INTO docs VALUES (1, ?)","args":["{\"name\":\"ada\"}"]}`)
+	if code != http.StatusOK {
+		t.Fatalf("insert json %d", code)
+	}
+	code, body = post(`{"sql":"SELECT json_extract(doc, '$.name') FROM docs WHERE json_extract(doc, '$.name') = 'ada'"}`)
+	if code != http.StatusOK || !strings.Contains(body, "ada") {
+		t.Fatalf("json select %d %s", code, body)
+	}
 }

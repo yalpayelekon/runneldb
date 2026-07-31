@@ -3,6 +3,7 @@ package runneldb
 import (
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -355,6 +356,166 @@ func TestDropTableCleansIndexes(t *testing.T) {
 	_, err := db.Exec(`DROP INDEX idx_v`)
 	if err == nil {
 		t.Fatal("expected error dropping index for dropped table")
+	}
+}
+
+func TestJSONColumnCRUD(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "json.wal")
+	db, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, doc JSON)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO docs VALUES (1, ?)`, `{"name":"ada","age":36}`); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query(`SELECT json_extract(doc, '$.name') FROM docs WHERE id = 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rows.Next() {
+		t.Fatal("expected row")
+	}
+	var name string
+	if err := rows.Scan(&name); err != nil {
+		t.Fatal(err)
+	}
+	_ = rows.Close()
+	if name != "ada" {
+		t.Fatalf("got %q", name)
+	}
+
+	rows, err = db.Query(`SELECT json_extract(doc, '$.name') FROM docs WHERE json_extract(doc, '$.name') = 'ada'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !rows.Next() {
+		t.Fatal("expected extract where row")
+	}
+	_ = rows.Close()
+
+	if err := db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	_ = db.Close()
+
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	rows, err = db.Query(`SELECT doc FROM docs WHERE id = 1`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if !rows.Next() {
+		t.Fatal("missing after reopen")
+	}
+	var doc string
+	if err := rows.Scan(&doc); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(doc, "ada") {
+		t.Fatalf("doc=%q", doc)
+	}
+}
+
+func TestJSONPathIndex(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, doc JSON)`); err != nil {
+		t.Fatal(err)
+	}
+	for i, name := range []string{"ada", "grace", "ada", "bob"} {
+		if _, err := db.Exec(`INSERT INTO docs VALUES (?, ?)`, int64(i+1), `{"name":"`+name+`"}`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := db.Exec(`CREATE INDEX idx_name ON docs(doc) PATH '$.name'`); err != nil {
+		t.Fatal(err)
+	}
+
+	db.mu.RLock()
+	si := db.secIndexes["idx_name"]
+	rks := si.lookup(Value{Typ: TypeText, Text: "ada"})
+	db.mu.RUnlock()
+	if len(rks) != 2 {
+		t.Fatalf("index lookup got %d keys", len(rks))
+	}
+
+	rows, err := db.Query(`SELECT id FROM docs WHERE json_extract(doc, '$.name') = 'ada'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		n++
+	}
+	if n != 2 {
+		t.Fatalf("rows=%d", n)
+	}
+
+	if _, err := db.Exec(`UPDATE docs SET doc = '{"name":"carol"}' WHERE id = 1`); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = db.Query(`SELECT id FROM docs WHERE json_extract(doc, '$.name') = 'ada'`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	n = 0
+	for rows.Next() {
+		n++
+	}
+	if n != 1 {
+		t.Fatalf("after update rows=%d", n)
+	}
+}
+
+func TestJSONPathIndexConcurrentRead(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE docs (id INTEGER PRIMARY KEY, doc JSON)`); err != nil {
+		t.Fatal(err)
+	}
+	for i := int64(1); i <= 20; i++ {
+		if _, err := db.Exec(`INSERT INTO docs VALUES (?, '{"name":"x"}')`, i); err != nil {
+			t.Fatal(err)
+		}
+	}
+	done := make(chan error, 1)
+	go func() {
+		rows, err := db.Query(`SELECT id FROM docs WHERE id = 1`)
+		if err != nil {
+			done <- err
+			return
+		}
+		_ = rows.Close()
+		done <- nil
+	}()
+	if _, err := db.Exec(`CREATE INDEX idx_n ON docs(doc) PATH '$.name'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestJSONPathIndexRejects(t *testing.T) {
+	db := openTestDB(t)
+	if _, err := db.Exec(`CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT, doc JSON)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE INDEX bad ON t(v) PATH '$.name'`); err == nil {
+		t.Fatal("expected PATH on TEXT to fail")
+	}
+	if _, err := parseSQL(`CREATE INDEX bad ON t(doc) PATH '$.a[0]'`); err == nil {
+		t.Fatal("expected bad path to fail")
+	}
+	if _, err := db.Exec(`INSERT INTO t VALUES (1, 'x', '{bad')`); err == nil {
+		t.Fatal("expected invalid JSON to fail")
 	}
 }
 

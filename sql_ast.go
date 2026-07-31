@@ -27,9 +27,23 @@ type insertStmt struct {
 
 func (insertStmt) stmtNode() {}
 
+type selectItemKind int
+
+const (
+	selectStar selectItemKind = iota
+	selectColumn
+	selectExtract
+)
+
+type selectItem struct {
+	kind   selectItemKind
+	column string // column name, or JSON column for extract
+	path   string // for extract
+}
+
 type selectStmt struct {
 	table   string
-	columns []string // empty or ["*"] means all
+	columns []selectItem // empty means all (*)
 	where   []pred
 }
 
@@ -55,8 +69,17 @@ type assign struct {
 	value  expr
 }
 
+type predKind int
+
+const (
+	predColumn predKind = iota
+	predExtract
+)
+
 type pred struct {
+	kind   predKind
 	column string
+	path   string // for predExtract
 	value  expr
 }
 
@@ -82,6 +105,7 @@ type createIndexStmt struct {
 	index  string
 	table  string
 	column string
+	path   string // optional JSON path for path indexes
 }
 
 func (createIndexStmt) stmtNode() {}

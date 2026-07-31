@@ -37,6 +37,12 @@ func (v Value) encode() []byte {
 		binary.LittleEndian.PutUint32(buf[1:5], uint32(len(v.Blob)))
 		copy(buf[5:], v.Blob)
 		return buf
+	case TypeJSON:
+		buf := make([]byte, 1+4+len(v.Blob))
+		buf[0] = 4
+		binary.LittleEndian.PutUint32(buf[1:5], uint32(len(v.Blob)))
+		copy(buf[5:], v.Blob)
+		return buf
 	default:
 		return []byte{0}
 	}
@@ -73,6 +79,16 @@ func decodeValue(data []byte) (Value, int, error) {
 		}
 		b := append([]byte(nil), data[5:5+n]...)
 		return Value{Typ: TypeBlob, Blob: b}, 5 + n, nil
+	case 4:
+		if len(data) < 5 {
+			return Value{}, 0, fmt.Errorf("%w: truncated json header", ErrSQL)
+		}
+		n := int(binary.LittleEndian.Uint32(data[1:5]))
+		if len(data) < 5+n {
+			return Value{}, 0, fmt.Errorf("%w: truncated json", ErrSQL)
+		}
+		b := append([]byte(nil), data[5:5+n]...)
+		return Value{Typ: TypeJSON, Blob: b}, 5 + n, nil
 	default:
 		return Value{}, 0, fmt.Errorf("%w: unknown value tag %d", ErrSQL, data[0])
 	}

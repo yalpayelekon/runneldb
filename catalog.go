@@ -13,6 +13,7 @@ const (
 	TypeInteger ColType = "INTEGER"
 	TypeText    ColType = "TEXT"
 	TypeBlob    ColType = "BLOB"
+	TypeJSON    ColType = "JSON"
 )
 
 // ColumnDef describes a table column.
